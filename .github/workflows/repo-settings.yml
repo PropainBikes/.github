@@ -1,0 +1,74 @@
+name: Repository settings
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+# GitHub has no org-wide default for "Automatically delete head branches", so this job turns it on in every
+# repository that doesn't have it yet, including repositories created since the last run. Archived repositories
+# are skipped, since their settings can't be changed.
+#
+# GITHUB_TOKEN can't change other repositories. The job uses the GitHub App propain-repo-settings (Administration:
+# write, installed on all repositories): repository variable REPO_SETTINGS_CLIENT_ID, secret REPO_SETTINGS_PRIVATE_KEY.
+#
+# Jobs run on the self-hosted runner on Coolify (labels self-hosted, coolify). The repository variable RUNS_ON
+# overrides the labels as JSON, e.g. '"ubuntu-latest"' to fall back to GitHub-hosted runners.
+jobs:
+  delete-branch-on-merge:
+    name: Delete head branches on merge
+    runs-on: ${{ fromJSON(vars.RUNS_ON || '["self-hosted", "coolify"]') }}
+    timeout-minutes: 5
+    steps:
+      - name: Create GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.REPO_SETTINGS_CLIENT_ID }}
+          private-key: ${{ secrets.REPO_SETTINGS_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          permission-administration: write
+
+      # curl and jq instead of the gh CLI, which isn't in the Coolify runner image.
+      - name: Enable "Automatically delete head branches"
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -o pipefail
+
+          api() {
+            curl -fsS -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" "$@"
+          }
+
+          page=1
+          repos=()
+          while :; do
+            names=$(api "https://api.github.com/installation/repositories?per_page=100&page=$page" \
+              | jq -r '.repositories[] | select(.archived | not) | .full_name')
+            [ -z "$names" ] && break
+            mapfile -t -O "${#repos[@]}" repos <<< "$names"
+            page=$((page + 1))
+          done
+
+          echo "Checked ${#repos[@]} repositories."
+          changed=0
+          for repo in "${repos[@]}"; do
+            if [ "$(api "https://api.github.com/repos/$repo" | jq -r .delete_branch_on_merge)" = "true" ]; then
+              continue
+            fi
+            api -X PATCH -d '{"delete_branch_on_merge":true}' "https://api.github.com/repos/$repo" > /dev/null
+            echo "Enabled in $repo"
+            echo "- Enabled in \`$repo\`" >> "$GITHUB_STEP_SUMMARY"
+            changed=$((changed + 1))
+          done
+
+          if [ "$changed" -eq 0 ]; then
+            echo "All ${#repos[@]} repositories already delete head branches on merge." >> "$GITHUB_STEP_SUMMARY"
+          fi
